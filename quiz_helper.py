@@ -1,4 +1,4 @@
-"""Vision and web-search analysis for the WeRead desktop quiz helper."""
+"""DeepSeek vision, web search, and answer selection for the WeRead quiz."""
 
 from __future__ import annotations
 
@@ -6,27 +6,31 @@ import base64
 import json
 import mimetypes
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 
-API_URL = "https://api.openai.com/v1/responses"
-DEFAULT_MODEL = "gpt-6-luna"
+API_URL = "https://api.deepseek.com/responses"
+SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
+DEFAULT_MODEL = "deepseek-flash"
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
-PROMPT = """你是微信读书答题辅助工具。请读取图片中当前一道题的完整题干与所有可见选项，先用网页搜索核对题目涉及的词语或知识，再给出最可能的答案。
-选项可能是文字、单个字、符号或笔画图形。请按从上到下的屏幕顺序辨认，不要把“一”“二”“三”或形似的横线混淆。
-填空题需要先还原完整词语，再指出对应的是第几个选项。只根据清晰可见的内容回答；不要把看不清的字猜成确定文字。若题干或选项缺失，明确写“无法判断”。
-请严格按下面四行输出，不要添加其他内容：
-题目：<识别到的题干或无法判断>
-选项：<按屏幕顺序列出第1项、第2项等，无法判断时写无法判断>
-建议：<第几个选项及选项原文，或无法判断>
-依据：<一句话说明搜索依据；不确定时说明不确定点>"""
+VISION_PROMPT = """读取微信读书截图中当前一道题及从上到下的全部选项。选项可能是单字、笔画或符号，尤其要分清“一、二、三”。
+只返回 JSON 对象，格式为 {"question":"题干", "options":["第一项","第二项"], "search_query":"用于搜索答案的简短中文关键词"}。
+填空题的 search_query 应包含空格前后的字和“填空”或“成语”。看不清题干或选项时，对应字段留空；不要编造。"""
 
-QUICK_PROMPT = """这是限时 12 秒的微信读书选择题。识别截图中的题干和从上到下排列的选项，立即搜索题目关键字验证答案；选项可能只是“一、二、三”等笔画图形。填空题先在内部还原完整词语。
-只输出正确选项的序号 1、2、3 或 4，不能确定时只输出 0。不要输出理由、标点或其他文字。"""
+QUICK_PROMPT = """这是限时 12 秒的选择题。根据题干、选项和已搜索到的网页摘要，判断从上到下第几个选项正确。
+只输出 1、2、3 或 4；搜索结果不足以判断时只输出 0。不要输出其他文字。"""
+
+DETAIL_PROMPT = """根据已识别题目和网页搜索摘要给出建议。若证据不足，明确写无法判断。
+严格按四行输出：
+题目：<题干>
+选项：<从上到下的选项>
+建议：<第几个选项及原文，或无法判断>
+依据：<一句话解释搜索证据>"""
 
 
 def image_data_url(path: str | Path) -> str:
@@ -52,67 +56,101 @@ def extract_text(response: dict) -> str:
                 parts.append(content["text"])
     result = "\n".join(parts).strip()
     if not result:
-        raise RuntimeError("模型没有返回可显示的文字，请更换模型或稍后重试。")
+        raise RuntimeError("模型没有返回可显示的文字，请稍后重试。")
     return result
 
 
-def analyze_image(
-    path: str | Path, *, api_key: str, model: str = DEFAULT_MODEL,
-    timeout: int = 25, quick: bool = False,
-) -> str:
-    if not api_key.strip():
-        raise ValueError("请先设置 OPENAI_API_KEY 环境变量。")
-    payload = {
-        "model": model.strip() or DEFAULT_MODEL,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": QUICK_PROMPT if quick else PROMPT},
-                {"type": "input_image", "image_url": image_data_url(path), "detail": "high"},
-            ],
-        }],
-        "reasoning": {"effort": "none"},
-        "tools": [{"type": "web_search", "search_context_size": "low"}],
-        "tool_choice": "required",
-        "include": ["web_search_call.action.sources"],
-        "max_output_tokens": 150 if quick else 450,
-        "store": False,
-    }
+def _post_json(url: str, payload: dict, api_key: str, deadline: float) -> dict:
+    remaining = deadline - time.monotonic()
+    if remaining < 0.5:
+        raise TimeoutError("本题剩余时间不足，已停止请求。")
     request = urllib.request.Request(
-        API_URL,
+        url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            data = json.load(response)
+        with urllib.request.urlopen(request, timeout=remaining) as response:
+            return json.load(response)
     except urllib.error.HTTPError as exc:
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("error", {}).get("message", "")
         except (UnicodeDecodeError, json.JSONDecodeError):
             detail = ""
-        raise RuntimeError(f"接口返回 HTTP {exc.code}：{detail or exc.reason}") from exc
+        raise RuntimeError(f"DeepSeek 接口返回 HTTP {exc.code}：{detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接模型接口：{exc.reason}") from exc
-    searched = any(item.get("type") == "web_search_call" and item.get("status") == "completed"
-                   for item in data.get("output", []))
-    if not searched:
-        raise RuntimeError("本次没有完成网页搜索，不能将未核对的答案显示为搜索结果。")
-    answer = extract_text(data)
+        raise RuntimeError(f"无法连接 DeepSeek 接口：{exc.reason}") from exc
+
+
+def _read_question(image_url: str, api_key: str, model: str, deadline: float) -> dict:
+    response = _post_json(API_URL, {
+        "model": model,
+        "input": [{"role": "user", "content": [
+            {"type": "input_text", "text": VISION_PROMPT},
+            {"type": "input_image", "image_url": image_url, "detail": "high"},
+        ]}],
+        "reasoning": {"effort": "none"},
+        "text": {"format": {"type": "json_object"}},
+        "max_output_tokens": 300,
+    }, api_key, deadline)
+    try:
+        parsed = json.loads(extract_text(response))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("DeepSeek 没有返回可解析的题目 JSON。") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("DeepSeek 返回的题目格式不正确。")
+    return parsed
+
+
+def _search_evidence(question: dict, api_key: str, deadline: float) -> list[dict]:
+    query = str(question.get("search_query") or question.get("question") or "").strip()[:128]
+    if not query:
+        return []
+    data = _post_json(SEARCH_URL, {"query": query, "count": 3, "need_content": False}, api_key, deadline)
+    results = data.get("results", [])
+    return [item for item in results if isinstance(item, dict) and item.get("snippet")]
+
+
+def analyze_image(
+    path: str | Path, *, api_key: str, model: str = DEFAULT_MODEL,
+    timeout: float = 25, quick: bool = False,
+) -> str:
+    if not api_key.strip():
+        raise ValueError("请先设置 DEEPSEEK_API_KEY 环境变量。")
+    if model.strip() != DEFAULT_MODEL:
+        raise ValueError("当前识图流程只支持 deepseek-flash，请把模型改回 deepseek-flash。")
+    deadline = time.monotonic() + timeout
+    image_url = image_data_url(path)
+    question = _read_question(image_url, api_key, model, deadline)
+    stem = str(question.get("question") or "").strip()
+    options = question.get("options")
+    if not stem or not isinstance(options, list) or not 2 <= len(options) <= 4:
+        return "无法判断"
+    options = [str(option).strip() for option in options]
+    if any(not option for option in options):
+        return "无法判断"
+    results = _search_evidence(question, api_key, deadline)
+    if not results:
+        return "无法判断"
+    evidence = [{"title": str(item.get("title", ""))[:120],
+                 "snippet": str(item.get("snippet", ""))[:350],
+                 "url": str(item.get("url", ""))}
+                for item in results[:3]]
+    response = _post_json(API_URL, {
+        "model": model,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text":
+            (QUICK_PROMPT if quick else DETAIL_PROMPT) + "\n题目和搜索结果：\n" +
+            json.dumps({"question": stem, "options": options, "search_results": evidence}, ensure_ascii=False)
+        }]}],
+        "reasoning": {"effort": "none"},
+        "max_output_tokens": 40 if quick else 350,
+    }, api_key, deadline)
+    answer = extract_text(response)
     if quick:
         match = re.fullmatch(r"\s*([0-4])\s*", answer)
-        if not match or match.group(1) == "0":
+        if not match or match.group(1) == "0" or int(match.group(1)) > len(options):
             return "无法判断"
         return f"第{match.group(1)}项"
-    sources: list[str] = []
-    for item in data.get("output", []):
-        if item.get("type") != "web_search_call":
-            continue
-        for source in item.get("action", {}).get("sources", []):
-            url = source.get("url", "")
-            if url.startswith(("https://", "http://")) and url not in sources:
-                sources.append(url)
-    if sources:
-        return answer + "\n搜索来源：\n" + "\n".join(sources[:3])
-    return answer
+    sources = [item["url"] for item in evidence if item["url"].startswith(("https://", "http://"))]
+    return answer + ("\n搜索来源：\n" + "\n".join(sources) if sources else "")

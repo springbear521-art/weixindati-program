@@ -14,9 +14,8 @@ ONE_PIXEL_PNG = base64.b64decode(
 
 
 class FakeResponse:
-    def __init__(self, text="建议：第2项（一）", searched=True):
-        self.text = text
-        self.searched = searched
+    def __init__(self, data):
+        self.data = data
 
     def __enter__(self):
         return self
@@ -25,72 +24,83 @@ class FakeResponse:
         return None
 
     def read(self):
-        output = ([{"type": "web_search_call", "status": "completed", "action": {
-            "sources": [{"url": "https://example.org/source"}]
-        }}] if self.searched else [])
-        output.append({"type": "message", "content": [
-            {"type": "output_text", "text": self.text}
-        ]})
-        return json.dumps({"output": output}).encode()
+        return json.dumps(self.data, ensure_ascii=False).encode()
+
+
+def model_response(text):
+    return FakeResponse({"output": [{"type": "message", "content": [
+        {"type": "output_text", "text": text}
+    ]}]})
 
 
 class QuizHelperTests(unittest.TestCase):
-    def test_vision_request_and_response(self):
-        with tempfile.TemporaryDirectory() as directory:
-            screenshot = Path(directory) / "question.png"
-            screenshot.write_bytes(ONE_PIXEL_PNG)
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(self.directory.cleanup)
+        self.screenshot = Path(self.directory.name) / "question.png"
+        self.screenshot.write_bytes(ONE_PIXEL_PNG)
 
-            def fake_urlopen(request, timeout):
+    def test_deepseek_vision_search_and_quick_answer(self):
+        calls = []
+
+        def fake_urlopen(request, timeout):
+            calls.append(request.full_url)
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
+            self.assertGreater(timeout, 0)
+            payload = json.loads(request.data)
+            if len(calls) == 1:
                 self.assertEqual(request.full_url, quiz_helper.API_URL)
-                self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
-                payload = json.loads(request.data)
-                self.assertEqual(payload["model"], quiz_helper.DEFAULT_MODEL)
-                self.assertEqual(payload["tool_choice"], "required")
-                self.assertEqual(payload["tools"][0]["type"], "web_search")
-                self.assertIn("web_search_call.action.sources", payload["include"])
+                self.assertEqual(payload["model"], "deepseek-flash")
+                self.assertEqual(payload["reasoning"]["effort"], "none")
+                self.assertEqual(payload["text"]["format"]["type"], "json_object")
                 image = payload["input"][0]["content"][1]
-                self.assertEqual(image["type"], "input_image")
                 self.assertTrue(image["image_url"].startswith("data:image/png;base64,"))
-                self.assertEqual(timeout, 25)
-                return FakeResponse()
+                return model_response(json.dumps({
+                    "question": "功亏___篑", "options": ["二", "一", "三"],
+                    "search_query": "功亏 篑 成语 填空",
+                }, ensure_ascii=False))
+            if len(calls) == 2:
+                self.assertEqual(request.full_url, quiz_helper.SEARCH_URL)
+                self.assertEqual(payload["query"], "功亏 篑 成语 填空")
+                return FakeResponse({"results": [{"title": "成语解释", "snippet": "功亏一篑", "url": "https://example.org/idiom"}]})
+            self.assertEqual(request.full_url, quiz_helper.API_URL)
+            self.assertIn("功亏一篑", payload["input"][0]["content"][0]["text"])
+            return model_response("2")
 
-            with patch("quiz_helper.urllib.request.urlopen", side_effect=fake_urlopen):
-                self.assertEqual(
-                    quiz_helper.analyze_image(screenshot, api_key="test-key"),
-                    "建议：第2项（一）\n搜索来源：\nhttps://example.org/source",
-                )
+        with patch("quiz_helper.urllib.request.urlopen", side_effect=fake_urlopen):
+            answer = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True, timeout=7)
+        self.assertEqual(answer, "第2项")
+        self.assertEqual(calls, [quiz_helper.API_URL, quiz_helper.SEARCH_URL, quiz_helper.API_URL])
 
     def test_rejects_missing_key_before_network(self):
-        with self.assertRaisesRegex(ValueError, "OPENAI_API_KEY"):
-            quiz_helper.analyze_image("question.png", api_key="")
+        with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY"):
+            quiz_helper.analyze_image(self.screenshot, api_key="")
 
-    def test_quick_mode_only_returns_choice_number(self):
-        with tempfile.TemporaryDirectory() as directory:
-            screenshot = Path(directory) / "question.png"
-            screenshot.write_bytes(ONE_PIXEL_PNG)
+    def test_no_search_results_returns_no_answer(self):
+        responses = [
+            model_response('{"question":"功亏___篑","options":["二","一","三"],"search_query":"功亏篑"}'),
+            FakeResponse({"results": []}),
+        ]
+        with patch("quiz_helper.urllib.request.urlopen", side_effect=responses) as urlopen:
+            answer = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True)
+        self.assertEqual(answer, "无法判断")
+        self.assertEqual(urlopen.call_count, 2)
 
-            def fake_urlopen(request, timeout):
-                payload = json.loads(request.data)
-                self.assertEqual(payload["max_output_tokens"], 150)
-                self.assertIn("限时 12 秒", payload["input"][0]["content"][0]["text"])
-                self.assertEqual(timeout, 7)
-                return FakeResponse("2")
-
-            with patch("quiz_helper.urllib.request.urlopen", side_effect=fake_urlopen):
-                answer = quiz_helper.analyze_image(screenshot, api_key="test-key", quick=True, timeout=7)
-            self.assertEqual(answer, "第2项")
+    def test_unreadable_question_skips_search(self):
+        with patch("quiz_helper.urllib.request.urlopen", return_value=model_response(
+            '{"question":"","options":[],"search_query":""}'
+        )) as urlopen:
+            answer = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True)
+        self.assertEqual(answer, "无法判断")
+        self.assertEqual(urlopen.call_count, 1)
 
     def test_rejects_empty_model_response(self):
         with self.assertRaisesRegex(RuntimeError, "没有返回"):
             quiz_helper.extract_text({"output": []})
 
-    def test_rejects_response_without_completed_search(self):
-        with tempfile.TemporaryDirectory() as directory:
-            screenshot = Path(directory) / "question.png"
-            screenshot.write_bytes(ONE_PIXEL_PNG)
-            with patch("quiz_helper.urllib.request.urlopen", return_value=FakeResponse(searched=False)):
-                with self.assertRaisesRegex(RuntimeError, "没有完成网页搜索"):
-                    quiz_helper.analyze_image(screenshot, api_key="test-key")
+    def test_rejects_non_flash_model_with_image(self):
+        with self.assertRaisesRegex(ValueError, "deepseek-flash"):
+            quiz_helper.analyze_image(self.screenshot, api_key="test-key", model="deepseek-v4-pro")
 
 
 if __name__ == "__main__":

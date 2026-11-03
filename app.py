@@ -35,7 +35,7 @@ class QuizApp(tk.Tk):
         self.window_handles: dict[str, int] = {}
         self.region: tuple[int, int, int, int] | None = None
         self.region_window: int | None = None
-        self.model = tk.StringVar(value=os.environ.get("OPENAI_MODEL", DEFAULT_MODEL))
+        self.model = tk.StringVar(value=DEFAULT_MODEL)
         self.status = tk.StringVar(value="选择电脑微信窗口，框选一次题目与选项，再启动自动监测。")
         self.captures: list[Path] = []
         self.running = False
@@ -93,8 +93,8 @@ class QuizApp(tk.Tk):
         model_row = ttk.Frame(frame)
         model_row.pack(fill="x", pady=(12, 0))
         ttk.Label(model_row, text="模型").pack(side="left")
-        ttk.Entry(model_row, textvariable=self.model, width=25).pack(side="left", padx=(8, 0))
-        ttk.Label(model_row, text="密钥从 OPENAI_API_KEY 环境变量读取").pack(side="left", padx=(12, 0))
+        ttk.Entry(model_row, textvariable=self.model, width=25, state="readonly").pack(side="left", padx=(8, 0))
+        ttk.Label(model_row, text="密钥从 DEEPSEEK_API_KEY 环境变量读取").pack(side="left", padx=(12, 0))
 
         self.analyze_button = ttk.Button(frame, text="识别并搜索所选图片", command=self.analyze)
         self.analyze_button.pack(anchor="w", pady=(16, 8))
@@ -339,7 +339,7 @@ class QuizApp(tk.Tk):
         if not path:
             messagebox.showinfo("答题助手", "请先选择截图或用“电脑截屏”。")
             return
-        key = os.environ.get("OPENAI_API_KEY", "")
+        key = os.environ.get("DEEPSEEK_API_KEY", "")
         model = self.model.get().strip()
         self.status.set("正在识别题目、网页搜索并生成建议……")
 
@@ -354,9 +354,9 @@ class QuizApp(tk.Tk):
     def capture_and_analyze(self) -> None:
         if self.running or self.monitoring:
             return
-        key = os.environ.get("OPENAI_API_KEY", "")
+        key = os.environ.get("DEEPSEEK_API_KEY", "")
         if not key:
-            messagebox.showinfo("答题助手", "请先设置 OPENAI_API_KEY 环境变量。")
+            messagebox.showinfo("答题助手", "请先设置 DEEPSEEK_API_KEY 环境变量。")
             return
         hwnd = self._selected_hwnd()
         if hwnd is None:
@@ -408,9 +408,9 @@ class QuizApp(tk.Tk):
         if self.region_window != hwnd or self.region is None:
             messagebox.showinfo("答题助手", "请先框选题干和全部选项；框选时尽量排除倒计时和动画。")
             return
-        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
         if not key:
-            messagebox.showinfo("答题助手", "请先设置 OPENAI_API_KEY 环境变量。")
+            messagebox.showinfo("答题助手", "请先设置 DEEPSEEK_API_KEY 环境变量。")
             return
         region, model = self.region, self.model.get().strip()
         try:

@@ -1,13 +1,13 @@
 # 微信读书电脑答题助手
 
-在电脑微信中通过分享链接打开答题小程序后，本程序截取对应窗口，把图片发给支持视觉与网页搜索的 OpenAI 模型，显示建议选项。你仍需自己在小程序中点选。
+在电脑微信中通过分享链接打开答题小程序后，本程序截取对应窗口，使用 DeepSeek API 识别题目、搜索网页并显示建议选项。你仍需自己在小程序中点选。
 
-每题只有 **12 秒**。自动模式持续观察一次框选的区域，题干画面变化并稳定后立即识别、搜索，结果显示在浮动小窗中。每次请求最多使用约 8.5 秒；这是从程序发现题目算起的预算，不保证网络搜索一定能赶上小程序倒计时。
+每题只有 **12 秒**。自动模式持续观察一次框选的区域，题干画面变化并稳定后立即识别、搜索，结果显示在浮动小窗中。程序从发现新题算起设置约 8.5 秒结果截止时间；DeepSeek 的识图、搜索和判断是三次串行请求，可能来不及在倒计时内返回。
 
 ## 运行条件
 
 - Windows、Python 3.10 或更新版本。仅使用 Python 标准库。
-- 可用的 OpenAI API 密钥，以及同时支持图像输入和 `web_search` 的模型。默认 `gpt-6-luna`，可在界面中修改。
+- 可用的 DeepSeek API 密钥。识图和最终判断使用 `deepseek-flash`，搜索使用 DeepSeek Search API。
 - 电脑微信已经打开答题小程序，题目和选项完整显示在屏幕上。窗口需要可见，不能被其他窗口遮挡。
 
 ## 启动
@@ -15,11 +15,11 @@
 在 PowerShell 中进入本项目文件夹：
 
 ```powershell
-$env:OPENAI_API_KEY = '你的 API 密钥'
+$env:DEEPSEEK_API_KEY = '你的 DeepSeek API 密钥'
 python app.py
 ```
 
-密钥只从环境变量读取，不写入项目文件。截图会发送给 OpenAI API，并可能产生图像处理和网页搜索费用。
+密钥只从环境变量读取，不写入项目文件。截图会发送给 DeepSeek API；模型和搜索请求可能产生费用。密钥需在 DeepSeek API 平台创建，DeepSeek 聊天网页的登录状态不能代替 API 密钥。
 
 ## 实时答题
 
@@ -35,11 +35,11 @@ python app.py
 
 ## 工作原理和限制
 
-`app.py` 负责框选、自动监测、浮动结果窗、全局 F8 和超时处理。`desktop_capture.py` 用 Windows API 截取目标窗口的框选区域，并对题干上部生成画面特征；画面变化且连续两帧稳定后才提交新题。这样选中答案导致的下部选项变色通常不会重复触发。`quiz_helper.py` 将图片和指令一起发送到 Responses API，要求模型调用网页搜索，再从结果中提取选项。程序检查返回里确有完成的 `web_search_call`；没有搜索就不显示为已核对答案。
+`app.py` 负责框选、自动监测、浮动结果窗、全局 F8 和超时处理。`desktop_capture.py` 用 Windows API 截取目标窗口的框选区域，并对题干上部生成画面特征；画面变化且连续两帧稳定后才提交新题。这样选中答案导致的下部选项变色通常不会重复触发。`quiz_helper.py` 依次调用 DeepSeek Flash 看图、DeepSeek Search 搜索关键词、DeepSeek Flash 根据搜索摘要判断选项。题干或选项看不清、搜索无结果时显示“无法判断”。
 
 程序不自动点击小程序。模型可能识别错笔画、搜到不相关结果或在 8.5 秒内无法完成；尤其“功亏___篑”这类题要核对选项从上到下的序号。分享进入电脑端不等于能读取小程序内部数据，本程序只处理屏幕截图。
 
-目前环境没有 `OPENAI_API_KEY`，也没有可供测试的电脑微信答题窗口，因此尚未做真实微信截图和在线时延实测。已用自建窗口验证拖框、自动首题触发、题目变化后二次触发且同题不重复请求；用模拟接口验证发送图像、强制搜索和结果解析。
+目前环境没有 `DEEPSEEK_API_KEY`，因此尚未做真实接口调用和在线时延实测。已用自建窗口验证拖框、自动首题触发、题目变化后二次触发且同题不重复请求；用模拟接口验证三步请求和结果解析。
 
 测试：
 
@@ -47,4 +47,4 @@ python app.py
 python -m unittest discover -s tests -v
 ```
 
-接口格式依据 [OpenAI 图像输入文档](https://developers.openai.com/api/docs/guides/images-vision)和[网页搜索文档](https://developers.openai.com/api/docs/guides/tools-web-search)。
+接口格式依据 [DeepSeek 图像输入文档](https://api-docs.deepseek.com/guides/vision/)、[Responses API 文档](https://api-docs.deepseek.com/guides/responses_api/)和[搜索 API 文档](https://api-docs.deepseek.com/guides/search/)。
