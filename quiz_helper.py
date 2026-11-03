@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import re
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -17,6 +19,7 @@ SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
 DEFAULT_MODEL = "deepseek-flash"
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 SUPPORTED_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+LOGGER = logging.getLogger("weread_quiz")
 
 VISION_PROMPT = """读取微信读书截图中当前一道题及从上到下的全部选项。选项可能是单字、笔画或符号，尤其要分清“一、二、三”。
 只返回 JSON 对象，格式为 {"question":"题干", "options":["第一项","第二项"], "search_query":"用于搜索答案的简短中文关键词"}。
@@ -31,6 +34,21 @@ DETAIL_PROMPT = """根据已识别题目和网页搜索摘要给出建议。若�
 选项：<从上到下的选项>
 建议：<第几个选项及原文，或无法判断>
 依据：<一句话解释搜索证据>"""
+
+
+@dataclass(frozen=True)
+class QuizResult:
+    question: str
+    options: tuple[str, ...]
+    answer_text: str
+    answer_index: int | None = None
+    details: str = ""
+    duplicate: bool = False
+
+
+def question_key(question: str, options: tuple[str, ...]) -> str:
+    """Normalize OCR whitespace and punctuation to avoid searching one question twice."""
+    return re.sub(r"[\W_]+", "", question, flags=re.UNICODE) + "|" + "|".join(options)
 
 
 def image_data_url(path: str | Path) -> str:
@@ -114,29 +132,40 @@ def _search_evidence(question: dict, api_key: str, deadline: float) -> list[dict
 
 def analyze_image(
     path: str | Path, *, api_key: str, model: str = DEFAULT_MODEL,
-    timeout: float = 25, quick: bool = False,
-) -> str:
+    timeout: float = 25, quick: bool = False, seen_questions: set[str] | None = None,
+) -> QuizResult:
     if not api_key.strip():
-        raise ValueError("请先设置 DEEPSEEK_API_KEY 环境变量。")
+        raise ValueError("请先在程序中保存 DeepSeek API 密钥。")
     if model.strip() != DEFAULT_MODEL:
         raise ValueError("当前识图流程只支持 deepseek-flash，请把模型改回 deepseek-flash。")
     deadline = time.monotonic() + timeout
     image_url = image_data_url(path)
+    stage_started = time.monotonic()
     question = _read_question(image_url, api_key, model, deadline)
+    LOGGER.info("Vision completed elapsed=%.2fs", time.monotonic() - stage_started)
     stem = str(question.get("question") or "").strip()
     options = question.get("options")
     if not stem or not isinstance(options, list) or not 2 <= len(options) <= 4:
-        return "无法判断"
+        return QuizResult(stem, (), "无法判断")
     options = [str(option).strip() for option in options]
     if any(not option for option in options):
-        return "无法判断"
+        return QuizResult(stem, tuple(options), "无法判断")
+    options_tuple = tuple(options)
+    key = question_key(stem, options_tuple)
+    if seen_questions is not None:
+        if key in seen_questions:
+            return QuizResult(stem, options_tuple, "", duplicate=True)
+        seen_questions.add(key)
+    stage_started = time.monotonic()
     results = _search_evidence(question, api_key, deadline)
+    LOGGER.info("Search completed results=%d elapsed=%.2fs", len(results), time.monotonic() - stage_started)
     if not results:
-        return "无法判断"
+        return QuizResult(stem, options_tuple, "无法判断")
     evidence = [{"title": str(item.get("title", ""))[:120],
                  "snippet": str(item.get("snippet", ""))[:350],
                  "url": str(item.get("url", ""))}
                 for item in results[:3]]
+    stage_started = time.monotonic()
     response = _post_json(API_URL, {
         "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text":
@@ -146,11 +175,17 @@ def analyze_image(
         "reasoning": {"effort": "none"},
         "max_output_tokens": 40 if quick else 350,
     }, api_key, deadline)
+    LOGGER.info("Decision completed elapsed=%.2fs", time.monotonic() - stage_started)
     answer = extract_text(response)
     if quick:
         match = re.fullmatch(r"\s*([0-4])\s*", answer)
         if not match or match.group(1) == "0" or int(match.group(1)) > len(options):
-            return "无法判断"
-        return f"第{match.group(1)}项"
+            return QuizResult(stem, options_tuple, "无法判断")
+        index = int(match.group(1))
+        return QuizResult(stem, options_tuple, options[index - 1], index)
     sources = [item["url"] for item in evidence if item["url"].startswith(("https://", "http://"))]
-    return answer + ("\n搜索来源：\n" + "\n".join(sources) if sources else "")
+    details = answer + ("\n搜索来源：\n" + "\n".join(sources) if sources else "")
+    match = re.search(r"建议：第\s*([1-4])\s*个?选项", answer)
+    index = int(match.group(1)) if match and int(match.group(1)) <= len(options) else None
+    return QuizResult(stem, options_tuple, options[index - 1] if index else "无法判断",
+                      index, details)

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import queue
+import re
 import threading
 import time
 import tkinter as tk
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -14,13 +18,31 @@ from desktop_capture import (
     activate_window, capture_window, f8_pressed, list_windows, read_window_frame,
     save_frame, set_dpi_awareness, signature_difference, window_rect,
 )
-from quiz_helper import DEFAULT_MODEL, analyze_image
+from credential_store import load_key, save_key
+from quiz_helper import DEFAULT_MODEL, QuizResult, analyze_image
 
 
 QUICK_BUDGET_SECONDS = 8.5
+EXPECTED_QUESTION_COUNT = 12
 MONITOR_INTERVAL_SECONDS = 0.25
 STABLE_DIFFERENCE = 0.003
 NEW_QUESTION_DIFFERENCE = 0.006
+WINDOW_STATE = Path(__file__).with_name(".window_state.json")
+LOG_PATH = Path(__file__).with_name("logs") / "quiz.log"
+
+
+def _logger() -> logging.Logger:
+    LOG_PATH.parent.mkdir(exist_ok=True)
+    logger = logging.getLogger("weread_quiz")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
+LOGGER = _logger()
 
 
 class QuizApp(tk.Tk):
@@ -28,15 +50,16 @@ class QuizApp(tk.Tk):
         set_dpi_awareness()
         super().__init__()
         self.title("微信读书电脑答题助手")
-        self.geometry("710x510")
-        self.minsize(610, 430)
+        self.geometry(self._load_geometry())
+        self.minsize(810, 660)
         self.image_path = tk.StringVar()
         self.window_name = tk.StringVar()
         self.window_handles: dict[str, int] = {}
-        self.region: tuple[int, int, int, int] | None = None
-        self.region_window: int | None = None
         self.model = tk.StringVar(value=DEFAULT_MODEL)
-        self.status = tk.StringVar(value="选择电脑微信窗口，框选一次题目与选项，再启动自动监测。")
+        self.status = tk.StringVar(value="选择电脑微信小程序窗口，保存密钥后，在开始答题前启动自动监测。")
+        self.key_input = tk.StringVar()
+        self.key_status = tk.StringVar(value="密钥状态：检查中")
+        self.session_results: list[QuizResult] = []
         self.captures: list[Path] = []
         self.running = False
         self.run_id = 0
@@ -50,67 +73,107 @@ class QuizApp(tk.Tk):
         self.monitor_answer = tk.StringVar(value="等待题目")
         self.events: queue.Queue = queue.Queue()
         self._build_ui()
+        self._refresh_key_status()
         self.refresh_windows()
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.after(20, self._poll_events)
         self.after(50, self._poll_hotkey)
+
+    def _load_geometry(self) -> str:
+        try:
+            saved = json.loads(WINDOW_STATE.read_text(encoding="utf-8"))["geometry"]
+            match = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", saved)
+            if match:
+                width, height, x, y = map(int, match.groups())
+                if 810 <= width <= self.winfo_screenwidth() and 660 <= height <= self.winfo_screenheight() \
+                        and 0 <= x < self.winfo_screenwidth() - 150 and 0 <= y < self.winfo_screenheight() - 100:
+                    return saved
+        except (OSError, KeyError, ValueError, TypeError):
+            pass
+        return "820x700"
+
+    def _refresh_key_status(self) -> None:
+        try:
+            saved = bool(load_key())
+        except OSError:
+            saved = False
+        self.key_status.set("密钥状态：已保存在 Windows 凭据管理器" if saved else
+                            "密钥状态：尚未保存；也可使用 DEEPSEEK_API_KEY 环境变量")
+
+    def _api_key(self) -> str:
+        return (load_key() or os.environ.get("DEEPSEEK_API_KEY", "")).strip()
+
+    def _save_key(self) -> None:
+        try:
+            save_key(self.key_input.get())
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("保存密钥失败", str(exc))
+            return
+        self.key_input.set("")
+        self._refresh_key_status()
+        LOGGER.info("DeepSeek key saved to Windows Credential Manager")
+        self.status.set("密钥已保存。以后启动程序无需再次输入。")
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self, padding=16)
         self.main_frame = frame
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="微信读书答题助手", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(frame, text="选择答题窗口并框选题目与选项。启动后自动监测新题，无需每题按键。", wraplength=670).pack(anchor="w", pady=(4, 14))
+        ttk.Label(frame, text="选择小程序窗口，开始答题前启动监测。程序自动截取整个窗口并识别新题。", wraplength=780).pack(anchor="w", pady=(4, 14))
 
         window_row = ttk.Frame(frame)
         window_row.pack(fill="x", pady=(0, 10))
         ttk.Label(window_row, text="答题窗口").pack(side="left")
         self.window_box = ttk.Combobox(window_row, textvariable=self.window_name, state="readonly")
         self.window_box.pack(side="left", fill="x", expand=True, padx=(8, 8))
-        self.window_box.bind("<<ComboboxSelected>>", lambda _event: self._update_region_label())
         self.refresh_button = ttk.Button(window_row, text="刷新窗口", command=self.refresh_windows)
         self.refresh_button.pack(side="left")
 
-        region_row = ttk.Frame(frame)
-        region_row.pack(fill="x", pady=(0, 10))
-        self.region_button = ttk.Button(region_row, text="框选题目区域", command=self.select_region)
-        self.region_button.pack(side="left")
-        self.region_label = tk.StringVar(value="尚未框选")
-        ttk.Label(region_row, textvariable=self.region_label).pack(side="left", padx=(10, 0))
-        self.monitor_button = ttk.Button(region_row, text="开始自动监测", command=self.toggle_monitor)
+        monitor_row = ttk.Frame(frame)
+        monitor_row.pack(fill="x", pady=(0, 10))
+        ttk.Label(monitor_row, text="截图范围：整个小程序窗口（无需框选）").pack(side="left")
+        self.monitor_button = ttk.Button(monitor_row, text="开始自动监测", command=self.toggle_monitor)
         self.monitor_button.pack(side="right")
 
         row = ttk.Frame(frame)
         row.pack(fill="x")
-        ttk.Entry(row, textvariable=self.image_path).pack(side="left", fill="x", expand=True)
-        self.pick_button = ttk.Button(row, text="选择截图", command=self.pick_image)
+        ttk.Entry(row, textvariable=self.image_path, width=12).pack(side="left", fill="x", expand=True)
+        self.pick_button = ttk.Button(row, text="选图片", command=self.pick_image)
         self.pick_button.pack(side="left", padx=(8, 0))
-        self.capture_button = ttk.Button(row, text="电脑截屏", command=self.capture)
+        self.capture_button = ttk.Button(row, text="截取窗口", command=self.capture)
         self.capture_button.pack(side="left", padx=(8, 0))
-        self.quick_button = ttk.Button(row, text="截图→搜索→答案 (F8)", command=self.capture_and_analyze)
+        self.quick_button = ttk.Button(row, text="截图答题 (F8)", command=self.capture_and_analyze)
         self.quick_button.pack(side="left", padx=(8, 0))
 
         model_row = ttk.Frame(frame)
         model_row.pack(fill="x", pady=(12, 0))
         ttk.Label(model_row, text="模型").pack(side="left")
         ttk.Entry(model_row, textvariable=self.model, width=25, state="readonly").pack(side="left", padx=(8, 0))
-        ttk.Label(model_row, text="密钥从 DEEPSEEK_API_KEY 环境变量读取").pack(side="left", padx=(12, 0))
+        key_row = ttk.Frame(frame)
+        key_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(key_row, text="API 密钥").pack(side="left")
+        ttk.Entry(key_row, textvariable=self.key_input, show="*", width=22).pack(side="left", padx=(6, 0))
+        ttk.Button(key_row, text="保存密钥", command=self._save_key).pack(side="left", padx=(8, 0))
+        ttk.Label(frame, textvariable=self.key_status).pack(anchor="w", pady=(5, 0))
 
         self.analyze_button = ttk.Button(frame, text="识别并搜索所选图片", command=self.analyze)
         self.analyze_button.pack(anchor="w", pady=(16, 8))
         ttk.Label(frame, textvariable=self.status, wraplength=570).pack(anchor="w", pady=(0, 8))
-        self.output = tk.Text(frame, font=("Microsoft YaHei UI", 12), wrap="word", height=12)
+        self.output = tk.Text(frame, font=("Microsoft YaHei UI", 12), wrap="word", width=1, height=1)
         self.output.pack(fill="both", expand=True)
-        self.output.insert("1.0", "结果将在这里显示。\n答案需要你自己核对后在小程序中点选。")
+        self.output.insert("1.0", "答案将在这里显示。\n请在小程序中核对后点选。")
         self.output.tag_configure("quick", font=("Microsoft YaHei UI", 28, "bold"))
         self.output.configure(state="disabled")
 
         self.monitor_frame = ttk.Frame(self, padding=12)
         ttk.Label(self.monitor_frame, text="自动答题监测", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
         ttk.Label(self.monitor_frame, textvariable=self.monitor_answer,
-                  font=("Microsoft YaHei UI", 28, "bold")).pack(anchor="center", pady=(3, 1))
-        ttk.Label(self.monitor_frame, textvariable=self.monitor_status, wraplength=240).pack(anchor="center")
-        ttk.Button(self.monitor_frame, text="停止并返回", command=self.stop_monitor).pack(anchor="center", pady=(5, 0))
+                  font=("Microsoft YaHei UI", 26, "bold"), wraplength=300).pack(anchor="center", pady=(3, 1))
+        ttk.Label(self.monitor_frame, textvariable=self.monitor_status, wraplength=300).pack(anchor="center")
+        controls = ttk.Frame(self.monitor_frame)
+        controls.pack(anchor="center", pady=(5, 0))
+        ttk.Button(controls, text="立即识别当前题", command=self.force_current_question).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="停止并返回", command=self.stop_monitor).pack(side="left")
 
     def pick_image(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.gif")])
@@ -130,85 +193,12 @@ class QuizApp(tk.Tk):
         else:
             matches = [label for label in labels if any(word in label.lower() for word in ("微信读书", "weread", "小程序"))]
             self.window_name.set(matches[0] if matches else "")
-        self._update_region_label()
-
-    def _update_region_label(self) -> None:
-        if self.region and self.region_window == self.window_handles.get(self.window_name.get()):
-            self.region_label.set(f"已框选 {self.region[2]}×{self.region[3]} 像素")
-        else:
-            self.region_label.set("尚未框选当前窗口")
 
     def _selected_hwnd(self) -> int | None:
         hwnd = self.window_handles.get(self.window_name.get())
         if hwnd is None:
             messagebox.showinfo("答题助手", "请先选择电脑微信中的答题窗口；若未显示，请点“刷新窗口”。")
         return hwnd
-
-    def select_region(self) -> None:
-        if self.running or self.monitoring:
-            return
-        hwnd = self._selected_hwnd()
-        if hwnd is None:
-            return
-        self.withdraw()
-        self.after(100, lambda: self._show_region_overlay(hwnd))
-
-    def _show_region_overlay(self, hwnd: int) -> None:
-        try:
-            activate_window(hwnd)
-            left, top, width, height = window_rect(hwnd)
-            overlay = tk.Toplevel(self)
-            overlay.overrideredirect(True)
-            overlay.attributes("-topmost", True)
-            overlay.attributes("-alpha", 0.35)
-            overlay.geometry(f"{width}x{height}+{left}+{top}")
-            canvas = tk.Canvas(overlay, bg="#101820", cursor="crosshair", highlightthickness=0)
-            canvas.pack(fill="both", expand=True)
-            canvas.create_text(width // 2, 30, text="拖动鼠标框住题干和所有选项；排除倒计时。Esc 取消",
-                               fill="white", font=("Microsoft YaHei UI", 12, "bold"))
-            drag = {"start": None, "rectangle": None}
-
-            def cancel(_event=None) -> None:
-                overlay.destroy()
-                self._restore()
-
-            def press(event) -> None:
-                drag["start"] = (event.x, event.y)
-                if drag["rectangle"] is not None:
-                    canvas.delete(drag["rectangle"])
-                drag["rectangle"] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
-                                                              outline="#00ffff", width=4)
-
-            def move(event) -> None:
-                if drag["start"] is not None:
-                    x, y = drag["start"]
-                    canvas.coords(drag["rectangle"], x, y, event.x, event.y)
-
-            def release(event) -> None:
-                if drag["start"] is None:
-                    return
-                x0, y0 = drag["start"]
-                x1, y1 = event.x, event.y
-                x, y = max(0, min(x0, x1)), max(0, min(y0, y1))
-                right, bottom = min(width, max(x0, x1)), min(height, max(y0, y1))
-                if right - x < 80 or bottom - y < 80:
-                    self.status.set("框选范围太小，请重新框选。")
-                    cancel()
-                    return
-                self.region = (x, y, right - x, bottom - y)
-                self.region_window = hwnd
-                self._update_region_label()
-                self.status.set("已保存框选区域。点击“开始自动监测”，之后每题自动识别。")
-                cancel()
-
-            canvas.bind("<ButtonPress-1>", press)
-            canvas.bind("<B1-Motion>", move)
-            canvas.bind("<ButtonRelease-1>", release)
-            overlay.bind("<Escape>", cancel)
-            overlay.focus_force()
-        except Exception as exc:
-            self._restore()
-            messagebox.showerror("答题助手", str(exc))
 
     def _poll_hotkey(self) -> None:
         down = f8_pressed()
@@ -231,7 +221,6 @@ class QuizApp(tk.Tk):
         self.quick_button.configure(state=state)
         self.analyze_button.configure(state=state)
         self.refresh_button.configure(state=state)
-        self.region_button.configure(state=state)
         self.monitor_button.configure(state="disabled" if enabled else "normal")
 
     def _result(self, value: str, *, quick: bool = False) -> None:
@@ -324,13 +313,12 @@ class QuizApp(tk.Tk):
             self.status.set("已截取画面。可点击“识别并搜索所选图片”。")
 
         self.withdraw()
-        region = self.region if self.region_window == hwnd else None
-        self._run(lambda: self._capture(hwnd, region), done, discard=lambda path: path.unlink(missing_ok=True))
+        self._run(lambda: self._capture(hwnd), done, discard=lambda path: path.unlink(missing_ok=True))
 
     @staticmethod
-    def _capture(hwnd: int, region: tuple[int, int, int, int] | None = None) -> Path:
+    def _capture(hwnd: int) -> Path:
         activate_window(hwnd)
-        return capture_window(hwnd, region)
+        return capture_window(hwnd)
 
     def analyze(self) -> None:
         if self.monitoring:
@@ -339,14 +327,15 @@ class QuizApp(tk.Tk):
         if not path:
             messagebox.showinfo("答题助手", "请先选择截图或用“电脑截屏”。")
             return
-        key = os.environ.get("DEEPSEEK_API_KEY", "")
+        key = self._api_key()
         model = self.model.get().strip()
         self.status.set("正在识别题目、网页搜索并生成建议……")
 
-        def done(answer: str) -> None:
+        def done(answer: QuizResult) -> None:
             self._busy(False)
-            self._result(answer)
+            self._result(answer.answer_text + ("\n\n" + answer.details if answer.details else ""))
             self.status.set("分析完成，请核对题目和选项后再点选。")
+            self._record_answer(answer)
             self.bell()
 
         self._run(lambda: analyze_image(path, api_key=key, model=model), done)
@@ -354,23 +343,19 @@ class QuizApp(tk.Tk):
     def capture_and_analyze(self) -> None:
         if self.running or self.monitoring:
             return
-        key = os.environ.get("DEEPSEEK_API_KEY", "")
+        key = self._api_key()
         if not key:
-            messagebox.showinfo("答题助手", "请先设置 DEEPSEEK_API_KEY 环境变量。")
+            messagebox.showinfo("答题助手", "请先输入并保存 DeepSeek API 密钥。")
             return
         hwnd = self._selected_hwnd()
         if hwnd is None:
             return
-        if self.region_window != hwnd or self.region is None:
-            messagebox.showinfo("答题助手", "请先点击“框选题目区域”，框住题干和所有选项。")
-            return
-        region = self.region
         model = self.model.get().strip()
         started = time.monotonic()
         self._result("正在截屏、搜索……", quick=True)
 
-        def task() -> tuple[Path, str, float, float]:
-            path = self._capture(hwnd, region)
+        def task() -> tuple[Path, QuizResult, float, float]:
+            path = self._capture(hwnd)
             captured = time.monotonic()
             try:
                 remaining = QUICK_BUDGET_SECONDS - (captured - started) - 0.5
@@ -383,14 +368,15 @@ class QuizApp(tk.Tk):
                 path.unlink(missing_ok=True)
                 raise
 
-        def done(result: tuple[Path, str, float, float]) -> None:
+        def done(result: tuple[Path, QuizResult, float, float]) -> None:
             path, answer, capture_time, model_time = result
             self._restore()
             self.captures.append(path)
             self.image_path.set(str(path))
             self._busy(False)
-            self._result(answer, quick=True)
+            self._result(answer.answer_text, quick=True)
             self.status.set(f"取图 {capture_time:.1f} 秒，识图与搜索 {model_time:.1f} 秒；请立即在电脑上核对并点选。")
+            self._record_answer(answer)
             self.bell()
 
         self.withdraw()
@@ -405,52 +391,48 @@ class QuizApp(tk.Tk):
         hwnd = self._selected_hwnd()
         if hwnd is None:
             return
-        if self.region_window != hwnd or self.region is None:
-            messagebox.showinfo("答题助手", "请先框选题干和全部选项；框选时尽量排除倒计时和动画。")
-            return
-        key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        key = self._api_key()
         if not key:
-            messagebox.showinfo("答题助手", "请先设置 DEEPSEEK_API_KEY 环境变量。")
+            messagebox.showinfo("答题助手", "请先输入并保存 DeepSeek API 密钥。")
             return
-        region, model = self.region, self.model.get().strip()
+        model = self.model.get().strip()
         try:
             activate_window(hwnd)
-            self._show_monitor_view(hwnd, region)
+            self._show_monitor_view(hwnd)
         except Exception as exc:
             messagebox.showerror("答题助手", str(exc))
             return
         self.monitor_id += 1
         monitor_id = self.monitor_id
         self.monitor_stop = threading.Event()
+        self.force_capture = threading.Event()
+        self.session_results.clear()
         self.monitoring = True
         self._busy(False)
         self.monitor_answer.set("等待题目")
-        self.monitor_status.set("画面稳定后自动识别、搜索")
-        self.status.set("自动监测中；题目变化后会自动分析。")
+        self.monitor_status.set("等待题目画面变化；已有题目可点立即识别")
+        self.status.set("自动监测中；请在小程序中开始答题。")
+        LOGGER.info("Monitor started hwnd=%s", hwnd)
         threading.Thread(target=self._monitor_loop,
-                         args=(monitor_id, self.monitor_stop, hwnd, region, key, model), daemon=True).start()
+                         args=(monitor_id, self.monitor_stop, hwnd, key, model), daemon=True).start()
 
-    def _show_monitor_view(self, hwnd: int, region: tuple[int, int, int, int]) -> None:
+    def _show_monitor_view(self, hwnd: int) -> None:
         left, top, width, height = window_rect(hwnd)
         self.saved_geometry = self.geometry()
         self.main_frame.pack_forget()
         self.monitor_frame.pack(fill="both", expand=True)
-        self.minsize(250, 145)
-        rx, ry, rw, rh = region
-        crop = (left + rx, top + ry, left + rx + rw, top + ry + rh)
-        popup_width, popup_height = 260, 155
+        self.minsize(380, 250)
+        popup_width, popup_height = 390, 265
         candidates = [
             (left + width + 10, top),
             (left - popup_width - 10, top),
-            (left + max(0, width - popup_width), top + max(0, ry - popup_height - 10)),
-            (left + max(0, width - popup_width), top + ry + rh + 10),
+            (left, top + height + 10),
         ]
         screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
         position = None
         for x, y in candidates:
             on_screen = x >= 0 and y >= 0 and x + popup_width <= screen_width and y + popup_height <= screen_height
-            overlaps_crop = x < crop[2] and x + popup_width > crop[0] and y < crop[3] and y + popup_height > crop[1]
-            if on_screen and not overlaps_crop:
+            if on_screen:
                 position = (x, y)
                 break
         if position is None:
@@ -458,16 +440,25 @@ class QuizApp(tk.Tk):
         self.geometry(f"{popup_width}x{popup_height}+{position[0]}+{position[1]}")
         self.attributes("-topmost", True)
 
+    def force_current_question(self) -> None:
+        if self.monitoring:
+            self.force_capture.set()
+            self.monitor_status.set("正在读取当前画面")
+
     def _monitor_loop(self, monitor_id: int, stop: threading.Event, hwnd: int,
-                      region: tuple[int, int, int, int], key: str, model: str) -> None:
+                      key: str, model: str) -> None:
         previous: bytes | None = None
         submitted: bytes | None = None
+        seen_questions: set[str] = set()
         stable_frames = 0
         blank_frames = 0
         try:
             while not stop.is_set():
-                frame = read_window_frame(hwnd, region)
+                frame = read_window_frame(hwnd)
                 signature = frame.signature
+                if submitted is None:
+                    # Establish a baseline before the quiz starts; do not analyze the start screen.
+                    submitted = signature
                 if max(signature) - min(signature) < 20:
                     blank_frames += 1
                     if blank_frames == 8:
@@ -482,23 +473,35 @@ class QuizApp(tk.Tk):
                 else:
                     stable_frames = 0
                 previous = signature
-                new_question = submitted is None or signature_difference(submitted, signature) >= NEW_QUESTION_DIFFERENCE
-                if stable_frames >= 1 and new_question:
+                change = signature_difference(submitted, signature)
+                forced = self.force_capture.is_set()
+                if forced or (stable_frames >= 1 and change >= NEW_QUESTION_DIFFERENCE):
+                    self.force_capture.clear()
                     submitted = signature
                     stable_frames = 0
                     path = save_frame(frame)
                     self.monitor_events.put((monitor_id, "analyzing", None))
+                    LOGGER.info("Question trigger forced=%s visual_change=%.4f", forced, change)
                     started = time.monotonic()
                     try:
                         answer = analyze_image(path, api_key=key, model=model,
-                                               timeout=QUICK_BUDGET_SECONDS - 0.3, quick=True)
+                                               timeout=QUICK_BUDGET_SECONDS - 0.3, quick=True,
+                                               seen_questions=seen_questions)
                     except Exception as exc:
                         path.unlink(missing_ok=True)
+                        LOGGER.warning("Question analysis failed type=%s elapsed=%.2fs", type(exc).__name__, time.monotonic() - started)
                         if "timed out" in str(exc).lower() or isinstance(exc, TimeoutError):
                             self.monitor_events.put((monitor_id, "timeout", None))
                             continue
                         raise
                     elapsed = time.monotonic() - started
+                    if answer.duplicate:
+                        path.unlink(missing_ok=True)
+                        LOGGER.info("Duplicate question skipped question=%r elapsed=%.2fs", answer.question, elapsed)
+                        self.monitor_events.put((monitor_id, "duplicate", None))
+                        continue
+                    LOGGER.info("Question analyzed question=%r answer=%r index=%s elapsed=%.2fs",
+                                answer.question, answer.answer_text, answer.answer_index, elapsed)
                     if elapsed > QUICK_BUDGET_SECONDS or stop.is_set():
                         path.unlink(missing_ok=True)
                         if not stop.is_set():
@@ -508,6 +511,7 @@ class QuizApp(tk.Tk):
                 stop.wait(MONITOR_INTERVAL_SECONDS)
         except Exception as exc:
             if not stop.is_set():
+                LOGGER.error("Monitor stopped unexpectedly type=%s", type(exc).__name__)
                 self.monitor_events.put((monitor_id, "error", str(exc)))
 
     def _poll_monitor_events(self) -> None:
@@ -527,17 +531,22 @@ class QuizApp(tk.Tk):
                 path, answer, elapsed = value
                 self.captures.append(path)
                 self.image_path.set(str(path))
-                self.monitor_answer.set(answer)
+                self.monitor_answer.set(answer.answer_text)
                 self.monitor_status.set(f"识图与搜索 {elapsed:.1f} 秒；请立即核对并点选")
-                self._result(answer, quick=True)
+                self._result(answer.answer_text, quick=True)
                 self.status.set(f"自动识别完成，用时 {elapsed:.1f} 秒。")
+                self._record_answer(answer)
                 self.bell()
+                if len(self.session_results) >= EXPECTED_QUESTION_COUNT:
+                    self.stop_monitor()
+            elif kind == "duplicate":
+                self.monitor_status.set("同一题已识别，继续等待新题")
             elif kind == "timeout":
                 self.monitor_answer.set("已超时")
                 self.monitor_status.set("本题未及时返回；继续监测下一题")
             elif kind == "blank":
                 self.monitor_answer.set("未看到题目")
-                self.monitor_status.set("截图似乎空白；请停止后检查窗口与框选区域")
+                self.monitor_status.set("截图似乎空白；请检查小程序窗口是否可见")
             elif kind == "error":
                 self.stop_monitor()
                 self.status.set(f"自动监测停止：{value}")
@@ -552,15 +561,41 @@ class QuizApp(tk.Tk):
         self.attributes("-topmost", False)
         self.monitor_frame.pack_forget()
         self.main_frame.pack(fill="both", expand=True)
-        self.minsize(610, 430)
+        self.minsize(810, 660)
         self.geometry(self.saved_geometry)
         self._busy(False)
-        self.status.set("已停止自动监测。可重新框选或再次启动。")
+        self.status.set("已停止自动监测。题目与答案汇总已输出到 PowerShell。")
+        LOGGER.info("Monitor stopped answers=%d", len(self.session_results))
+        self._print_session_summary()
+
+    def _record_answer(self, answer: QuizResult) -> None:
+        if not answer.question or answer.duplicate:
+            return
+        if not any(item.question == answer.question and item.options == answer.options
+                   for item in self.session_results):
+            self.session_results.append(answer)
+
+    def _print_session_summary(self) -> None:
+        print("\n=== 本次答题：题目与答案 ===", flush=True)
+        if not self.session_results:
+            print("没有记录到已识别题目。", flush=True)
+        for number, item in enumerate(self.session_results, 1):
+            suffix = f"（第{item.answer_index}项）" if item.answer_index else ""
+            print(f"{number}. {item.question} → {item.answer_text}{suffix}", flush=True)
+        print(f"共 {len(self.session_results)} 题。\n", flush=True)
+        self.session_results.clear()
 
     def close(self) -> None:
         self.closing = True
+        geometry_to_save = self.saved_geometry if self.monitoring else self.geometry()
         if self.monitoring:
             self.stop_monitor()
+        elif self.session_results:
+            self._print_session_summary()
+        try:
+            WINDOW_STATE.write_text(json.dumps({"geometry": geometry_to_save}), encoding="utf-8")
+        except OSError:
+            LOGGER.warning("Could not save main window geometry")
         while not self.monitor_events.empty():
             _monitor_id, kind, value = self.monitor_events.get_nowait()
             if kind == "answer":

@@ -69,11 +69,13 @@ class QuizHelperTests(unittest.TestCase):
 
         with patch("quiz_helper.urllib.request.urlopen", side_effect=fake_urlopen):
             answer = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True, timeout=7)
-        self.assertEqual(answer, "第2项")
+        self.assertEqual(answer.answer_text, "一")
+        self.assertEqual(answer.answer_index, 2)
+        self.assertEqual(answer.question, "功亏___篑")
         self.assertEqual(calls, [quiz_helper.API_URL, quiz_helper.SEARCH_URL, quiz_helper.API_URL])
 
     def test_rejects_missing_key_before_network(self):
-        with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY"):
+        with self.assertRaisesRegex(ValueError, "DeepSeek API 密钥"):
             quiz_helper.analyze_image(self.screenshot, api_key="")
 
     def test_no_search_results_returns_no_answer(self):
@@ -83,7 +85,7 @@ class QuizHelperTests(unittest.TestCase):
         ]
         with patch("quiz_helper.urllib.request.urlopen", side_effect=responses) as urlopen:
             answer = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True)
-        self.assertEqual(answer, "无法判断")
+        self.assertEqual(answer.answer_text, "无法判断")
         self.assertEqual(urlopen.call_count, 2)
 
     def test_unreadable_question_skips_search(self):
@@ -91,8 +93,25 @@ class QuizHelperTests(unittest.TestCase):
             '{"question":"","options":[],"search_query":""}'
         )) as urlopen:
             answer = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True)
-        self.assertEqual(answer, "无法判断")
+        self.assertEqual(answer.answer_text, "无法判断")
         self.assertEqual(urlopen.call_count, 1)
+
+    def test_duplicate_question_does_not_search_again(self):
+        responses = [
+            model_response('{"question":"功亏___篑","options":["二","一","三"],"search_query":"功亏篑"}'),
+            FakeResponse({"results": [{"title": "成语", "snippet": "功亏一篑"}]}),
+            model_response("2"),
+            model_response('{"question":"功亏 ___ 篑","options":["二","一","三"],"search_query":"功亏篑"}'),
+        ]
+        seen = set()
+        with patch("quiz_helper.urllib.request.urlopen", side_effect=responses) as urlopen:
+            first = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True,
+                                              seen_questions=seen)
+            second = quiz_helper.analyze_image(self.screenshot, api_key="test-key", quick=True,
+                                               seen_questions=seen)
+        self.assertEqual(first.answer_text, "一")
+        self.assertTrue(second.duplicate)
+        self.assertEqual(urlopen.call_count, 4)
 
     def test_rejects_empty_model_response(self):
         with self.assertRaisesRegex(RuntimeError, "没有返回"):

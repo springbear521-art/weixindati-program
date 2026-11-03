@@ -144,14 +144,17 @@ def signature_difference(first: bytes, second: bytes) -> float:
 
 
 def _signature(raw: bytes, width: int, height: int) -> bytes:
-    # The upper 45% holds the question; answer selection animations are lower down.
-    question_height = max(1, int(height * 0.45))
-    sample_width, sample_height = min(width, 128), min(question_height, 64)
+    # In a full mini-program window, the question is near the upper middle.
+    # Exclude the header/countdown and the answer animation below it.
+    x_start, x_end = int(width * 0.12), max(1, int(width * 0.88))
+    y_start, y_end = int(height * 0.23), max(1, int(height * 0.37))
+    sample_width = min(max(1, x_end - x_start), 128)
+    sample_height = min(max(1, y_end - y_start), 64)
     result = bytearray()
     for y_index in range(sample_height):
-        y = min(question_height - 1, (y_index * question_height + question_height // 2) // sample_height)
+        y = min(height - 1, y_start + (y_index * (y_end - y_start) + (y_end - y_start) // 2) // sample_height)
         for x_index in range(sample_width):
-            x = min(width - 1, (x_index * width + width // 2) // sample_width)
+            x = min(width - 1, x_start + (x_index * (x_end - x_start) + (x_end - x_start) // 2) // sample_width)
             offset = (y * width + x) * 4
             b, g, r = raw[offset], raw[offset + 1], raw[offset + 2]
             result.append((r * 30 + g * 59 + b * 11) // 100)
