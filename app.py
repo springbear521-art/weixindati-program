@@ -538,7 +538,9 @@ class QuizApp(tk.Tk):
                 self._record_answer(answer)
                 self.bell()
                 if len(self.session_results) >= EXPECTED_QUESTION_COUNT:
-                    self.stop_monitor()
+                    session_id = self.monitor_id
+                    self.monitor_status.set("第 12 题答案已显示；12 秒后自动汇总")
+                    self.after(12000, lambda: self._finish_completed_session(session_id))
             elif kind == "duplicate":
                 self.monitor_status.set("同一题已识别，继续等待新题")
             elif kind == "timeout":
@@ -551,6 +553,10 @@ class QuizApp(tk.Tk):
                 self.stop_monitor()
                 self.status.set(f"自动监测停止：{value}")
                 messagebox.showerror("自动监测停止", value)
+
+    def _finish_completed_session(self, session_id: int) -> None:
+        if self.monitoring and self.monitor_id == session_id and len(self.session_results) >= EXPECTED_QUESTION_COUNT:
+            self.stop_monitor()
 
     def stop_monitor(self) -> None:
         if not self.monitoring:
