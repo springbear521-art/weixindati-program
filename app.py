@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from desktop_capture import (
     activate_window, capture_window, f8_pressed, list_windows, read_window_frame,
-    save_frame, set_dpi_awareness, signature_difference, window_rect,
+    save_frame, set_dpi_awareness, signature_difference,
 )
 from credential_store import load_key, save_key
 from quiz_helper import DEFAULT_MODEL, QuizResult, analyze_image
@@ -167,19 +167,20 @@ class QuizApp(tk.Tk):
 
         self.monitor_frame = ttk.Frame(self, padding=12)
         ttk.Label(self.monitor_frame, text="自动答题监测", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w")
-        ttk.Label(self.monitor_frame, textvariable=self.monitor_answer,
-                  font=("Microsoft YaHei UI", 26, "bold"), wraplength=300).pack(anchor="center", pady=(3, 1))
-        ttk.Label(self.monitor_frame, textvariable=self.monitor_status, wraplength=300).pack(anchor="center")
         controls = ttk.Frame(self.monitor_frame)
-        controls.pack(anchor="center", pady=(5, 0))
+        controls.pack(side="bottom", anchor="center", pady=(8, 16))
         ttk.Button(controls, text="立即识别当前题", command=self.force_current_question).pack(side="left", padx=(0, 6))
         ttk.Button(controls, text="停止并返回", command=self.stop_monitor).pack(side="left")
+        ttk.Label(self.monitor_frame, textvariable=self.monitor_status, wraplength=740).pack(side="bottom", anchor="center")
+        ttk.Label(self.monitor_frame, textvariable=self.monitor_answer,
+                  font=("Microsoft YaHei UI", 38, "bold"), wraplength=740,
+                  anchor="center", justify="center").pack(fill="both", expand=True)
 
     def pick_image(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("图片", "*.png *.jpg *.jpeg *.webp *.gif")])
         if path:
             self.image_path.set(path)
-            self.status.set("已选择截图，点击“分析当前题目”。")
+            self.status.set("已选择截图，点击“识别并搜索所选图片”。")
 
     def refresh_windows(self) -> None:
         previous = self.window_name.get()
@@ -398,7 +399,7 @@ class QuizApp(tk.Tk):
         model = self.model.get().strip()
         try:
             activate_window(hwnd)
-            self._show_monitor_view(hwnd)
+            self._show_monitor_view()
         except Exception as exc:
             messagebox.showerror("答题助手", str(exc))
             return
@@ -416,28 +417,10 @@ class QuizApp(tk.Tk):
         threading.Thread(target=self._monitor_loop,
                          args=(monitor_id, self.monitor_stop, hwnd, key, model), daemon=True).start()
 
-    def _show_monitor_view(self, hwnd: int) -> None:
-        left, top, width, height = window_rect(hwnd)
+    def _show_monitor_view(self) -> None:
         self.saved_geometry = self.geometry()
         self.main_frame.pack_forget()
         self.monitor_frame.pack(fill="both", expand=True)
-        self.minsize(380, 250)
-        popup_width, popup_height = 390, 265
-        candidates = [
-            (left + width + 10, top),
-            (left - popup_width - 10, top),
-            (left, top + height + 10),
-        ]
-        screen_width, screen_height = self.winfo_screenwidth(), self.winfo_screenheight()
-        position = None
-        for x, y in candidates:
-            on_screen = x >= 0 and y >= 0 and x + popup_width <= screen_width and y + popup_height <= screen_height
-            if on_screen:
-                position = (x, y)
-                break
-        if position is None:
-            position = (max(0, screen_width - popup_width - 10), 10)
-        self.geometry(f"{popup_width}x{popup_height}+{position[0]}+{position[1]}")
         self.attributes("-topmost", True)
 
     def force_current_question(self) -> None:
