@@ -6,14 +6,9 @@
 
 ## 一、准备工作（首次使用）
 
-1. 确认电脑是 Windows，已安装 Python 3.10 或更新版本。按 `Win` 键，输入 **PowerShell**，打开“Windows PowerShell”或“终端”中的 PowerShell。窗口提示符通常以 `PS` 开头。不要在“命令提示符 / CMD”中输入下面的 `Set-Location` 命令。
+1. 确认电脑是 Windows，已安装 Python 3.10 或更新版本。按 `Win` 键，输入 **PowerShell**，打开“Windows PowerShell”或“终端”中的 PowerShell。窗口提示符通常以 `PS` 开头。
 2. 在 PowerShell 中输入 `python --version`，确认能显示 Python 版本。如果提示找不到 `python`，可试 `py --version`；后面的 `python app.py` 相应改为 `py app.py`。
-3. 在 PowerShell 中进入本项目文件夹。复制整行命令，按回车：
-
-   ```powershell
-   Set-Location -LiteralPath 'C:\Users\zhangxiaopeng\Documents\ChatGPT\答题程序运行 2'
-   ```
-
+3. 在文件资源管理器中打开含有 `app.py` 的项目文件夹。单击上方**地址栏**，输入 `powershell` 并按回车；新打开的 PowerShell 会直接位于这个文件夹。不要把自己电脑的完整路径写进准备上传 GitHub 的文件。
 4. 输入 `Get-ChildItem app.py`。若显示 `app.py`，说明已经进入正确文件夹。
 5. 准备 DeepSeek **API 密钥**。这与 DeepSeek 聊天网页的登录账号不同。程序使用 `deepseek-flash` 识别与判断、DeepSeek Search API 搜索。接口调用可能产生费用。
 6. 在同一个 PowerShell 窗口输入 `python app.py`（第 2 步使用 `py` 的话输入 `py app.py`），按回车。出现“微信读书答题助手”窗口后，在“API 密钥”输入框粘贴密钥，点击“保存密钥”。字符会以星号隐藏；保存后输入框清空，状态会显示“已保存在 Windows 凭据管理器”。
@@ -22,7 +17,7 @@
 
 ## 二、每次打开程序
 
-1. 打开 PowerShell，并运行上面的 `Set-Location -LiteralPath 'C:\Users\zhangxiaopeng\Documents\ChatGPT\答题程序运行 2'`。
+1. 在文件资源管理器中打开含 `app.py` 的项目文件夹，单击地址栏，输入 `powershell` 并按回车。
 2. 输入 `python app.py`，按回车。如果你的电脑只识别 `py`，输入 `py app.py`。**保持这个 PowerShell 窗口打开**，答题结束后的汇总会显示在这里。
 3. 在电脑微信里通过分享链接打开答题小程序，保持小程序窗口可见。先停留在“开始答题”之前的页面。
 4. 在助手的“答题窗口”下拉列表中选择小程序窗口。刚打开小程序而列表中没有时，点“刷新窗口”再选择。
