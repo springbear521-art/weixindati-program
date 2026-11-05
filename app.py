@@ -553,7 +553,7 @@ class QuizApp(tk.Tk):
         self.minsize(810, 660)
         self.geometry(self.saved_geometry)
         self._busy(False)
-        self.status.set("已停止自动监测。题目与答案汇总已输出到 PowerShell。")
+        self.status.set("已停止自动监测。题目与答案汇总已输出到启动程序的命令窗口。")
         LOGGER.info("Monitor stopped answers=%d", len(self.session_results))
         self._print_session_summary()
 
