@@ -11,10 +11,14 @@ from quiz_helper import QuizResult
 
 
 class MonitorTests(unittest.TestCase):
-    def test_start_screen_is_baseline_and_first_question_triggers_once(self):
+    def test_small_animation_is_ignored_before_first_question(self):
         start = WindowFrame(b"", 200, 200, bytes([0, 100]) * 64)
+        animated_signature = bytearray(start.signature)
+        for index in range(3):
+            animated_signature[index] = 100 - animated_signature[index]
+        animation = WindowFrame(b"", 200, 200, bytes(animated_signature))
         question = WindowFrame(b"", 200, 200, bytes([100, 0]) * 64)
-        frames = iter([start, start, question, question, question])
+        frames = iter([start, start, animation, animation, question, question, question])
         stop = threading.Event()
         fake_app = type("Monitor", (), {
             "monitor_events": queue.Queue(),

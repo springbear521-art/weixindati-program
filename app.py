@@ -26,7 +26,7 @@ QUICK_BUDGET_SECONDS = 8.5
 EXPECTED_QUESTION_COUNT = 12
 MONITOR_INTERVAL_SECONDS = 0.25
 STABLE_DIFFERENCE = 0.003
-NEW_QUESTION_DIFFERENCE = 0.006
+NEW_QUESTION_DIFFERENCE = 0.03
 WINDOW_STATE = Path(__file__).with_name(".window_state.json")
 LOG_PATH = Path(__file__).with_name("logs") / "quiz.log"
 
@@ -432,6 +432,7 @@ class QuizApp(tk.Tk):
                       key: str, model: str) -> None:
         previous: bytes | None = None
         submitted: bytes | None = None
+        change_started: float | None = None
         seen_questions: set[str] = set()
         stable_frames = 0
         blank_frames = 0
@@ -448,6 +449,7 @@ class QuizApp(tk.Tk):
                         self.monitor_events.put((monitor_id, "blank", None))
                     stable_frames = 0
                     previous = signature
+                    change_started = None
                     stop.wait(MONITOR_INTERVAL_SECONDS)
                     continue
                 blank_frames = 0
@@ -457,14 +459,22 @@ class QuizApp(tk.Tk):
                     stable_frames = 0
                 previous = signature
                 change = signature_difference(submitted, signature)
+                if change >= NEW_QUESTION_DIFFERENCE:
+                    if change_started is None:
+                        change_started = time.monotonic()
+                else:
+                    change_started = None
                 forced = self.force_capture.is_set()
                 if forced or (stable_frames >= 1 and change >= NEW_QUESTION_DIFFERENCE):
+                    detection_delay = time.monotonic() - change_started if change_started is not None else 0.0
                     self.force_capture.clear()
                     submitted = signature
                     stable_frames = 0
+                    change_started = None
                     path = save_frame(frame)
                     self.monitor_events.put((monitor_id, "analyzing", None))
-                    LOGGER.info("Question trigger forced=%s visual_change=%.4f", forced, change)
+                    LOGGER.info("Question trigger forced=%s visual_change=%.4f detection_delay=%.2fs",
+                                forced, change, detection_delay)
                     started = time.monotonic()
                     try:
                         answer = analyze_image(path, api_key=key, model=model,
