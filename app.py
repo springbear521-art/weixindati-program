@@ -337,7 +337,6 @@ class QuizApp(tk.Tk):
             self._result(answer.answer_text + ("\n\n" + answer.details if answer.details else ""))
             self.status.set("分析完成，请核对题目和选项后再点选。")
             self._record_answer(answer)
-            self.bell()
 
         self._run(lambda: analyze_image(path, api_key=key, model=model), done)
 
@@ -378,7 +377,6 @@ class QuizApp(tk.Tk):
             self._result(answer.answer_text, quick=True)
             self.status.set(f"取图 {capture_time:.1f} 秒，识图与搜索 {model_time:.1f} 秒；请立即在电脑上核对并点选。")
             self._record_answer(answer)
-            self.bell()
 
         self.withdraw()
         self._run(task, done, deadline_seconds=QUICK_BUDGET_SECONDS, discard=lambda result: result[0].unlink(missing_ok=True))
@@ -529,7 +527,6 @@ class QuizApp(tk.Tk):
                 self._result(answer.answer_text, quick=True)
                 self.status.set(f"自动识别完成，用时 {elapsed:.1f} 秒。")
                 self._record_answer(answer)
-                self.bell()
                 if len(self.session_results) >= EXPECTED_QUESTION_COUNT:
                     session_id = self.monitor_id
                     self.monitor_status.set("第 12 题答案已显示；12 秒后自动汇总")
